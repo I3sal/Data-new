@@ -1,2 +1,6 @@
 aiogram==2.25.1
 pyrogram
+tgcrypto
+aiohttp==3.8.1
+aiodns
+cchardet
