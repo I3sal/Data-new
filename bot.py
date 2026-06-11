@@ -8,7 +8,7 @@ import zipfile
 def download_data():
     if not os.path.exists("data"): # تأكدنا من المجلد باسم data
         print("جاري التحميل وفك الضغط...")
-        url = "ضع_رابطك_المباشر_هنا"
+        url = "https://www.mediafire.com/file/i8x5x9844vl24o5/mydata.zip/file"
         try:
             response = requests.get(url)
             with open("mydata.zip", "wb") as f:
