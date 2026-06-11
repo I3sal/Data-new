@@ -1,75 +1,70 @@
 import subprocess
 from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import os
 import requests
 import zipfile
-
-# دالة التحميل (تأكد من استخدام رابط مباشر ثابت إذا أمكن)
-def download_data():
-    if not os.path.exists("data"): # تأكدنا من المجلد باسم data
-        print("جاري التحميل وفك الضغط...")
-        url = "https://www.mediafire.com/file/i8x5x9844vl24o5/mydata.zip/file"
-        try:
-            response = requests.get(url)
-            with open("mydata.zip", "wb") as f:
-                f.write(response.content)
-            with zipfile.ZipFile("mydata.zip", "r") as zip_ref:
-                zip_ref.extractall(".")
-            print("تم التحميل والفك!")
-        except Exception as e:
-            print(f"خطأ في التحميل: {e}")
-
-download_data()
 
 API_TOKEN = '8723495517:AAEFsdiG0DR6NK8BHpwhVmATSlTVgkJah6o'
 ADMIN_ID = 8506955611 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
-
 allowed_users = [ADMIN_ID]
 
-# 1. خاصية الـ Start (سترات)
+# دالة التحميل المباشر الذكية
+def download_data():
+    if not os.path.exists("data"):
+        print("جاري التحميل...")
+        # ضع رابط التحميل المباشر لملف ZIP الخاص بك هنا
+        url = "رابط_تحميلك_المباشر_هنا" 
+        try:
+            r = requests.get(url, stream=True)
+            with open("mydata.zip", "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            with zipfile.ZipFile("mydata.zip", 'r') as zip_ref:
+                zip_ref.extractall(".")
+            print("تم الفك بنجاح!")
+        except Exception as e:
+            print(f"Error: {e}")
+
+download_data()
+
+def get_main_keyboard():
+    keyboard = InlineKeyboardMarkup()
+    keyboard.add(InlineKeyboardButton("🔍 Search User", callback_data="search_user"))
+    return keyboard
+
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
-    await message.reply("👋 أهلاً بك في بوت البحث عن البيانات.\n\n"
-                        "يرجى إرسال رابط مجموعتك للتحقق، أو استخدم /u [username] للبحث.")
+    await message.answer("👋 Welcome!\nمرحباً بك في بوت البحث.\n\nChoose an option:", reply_markup=get_main_keyboard())
 
-# 2. خاصية البحث المطور مع التحقق من وجود اليوزر
-@dp.message_handler(commands=['u'])
-async def search(message: types.Message):
+@dp.callback_query_handler(text="search_user")
+async def ask_search(call: types.CallbackQuery):
+    await call.message.answer("⌨️ Send username/email:\nأرسل اليوزر أو الإيميل:")
+
+@dp.message_handler()
+async def process_search(message: types.Message):
     if message.from_user.id not in allowed_users:
-        await message.reply("🚫 غير مصرح لك! يرجى مشاركة رابط القروب أولاً.")
+        await message.reply("🚫 Not authorized.")
         return
 
-    query = message.get_args()
-    if not query:
-        await message.reply("⚠️ مثال: `/u username`")
-        return
-
-    # استخدام grep مع العلم -w للبحث عن الكلمة كاملة (مطابقة دقيقة)
-    process = subprocess.run(f"grep -whw '{query}' data/part_* | head -n 10", 
+    query = message.text
+    # البحث في كل ملفات البيانات
+    process = subprocess.run(f"grep -rwh '{query}' . | head -n 5", 
                              shell=True, capture_output=True, text=True)
     
-    if process.stdout.strip():
-        await message.reply(f"✅ **النتائج المطابقة لـ `{query}`:**\n\n`{process.stdout.strip()}`", parse_mode="Markdown")
-    else:
-        await message.reply(f"❌ لم يتم العثور على اليوزر `{query}` في قواعد البيانات.", parse_mode="Markdown")
-
-# 3. الرد التلقائي والتحقق من المستخدم
-@dp.message_handler()
-async def auto_reply(message: types.Message):
-    # التحقق من رابط القروب
-    if "t.me/" in message.text and message.from_user.id not in allowed_users:
-        allowed_users.append(message.from_user.id)
-        await message.reply("✅ تم قبول رابطك! يمكنك الآن استخدام أمر /u للبحث.")
+    results = process.stdout.strip().split('\n')
     
-    # الرد التلقائي لمن لا يملك صلاحية
-    elif message.from_user.id not in allowed_users:
-        await message.reply("🚫 يرجى إرسال رابط القروب ليتم تفعيل اشتراكك.")
-    
-    # الرد التلقائي لمن لديه صلاحية
+    if results and results[0]:
+        response = "✅ **Results / النتائج:**\n\n"
+        for line in results:
+            user = line.split(':')[0].replace('@', '')
+            link = f"https://x.com/{user}"
+            response += f"👤 **Account:** `{user}`\n🔗 [Open on X]({link})\n📄 **Data:** `{line}`\n──────────────\n"
+        await message.answer(response, parse_mode="Markdown")
     else:
-        await message.reply("أنا هنا! إذا كنت تبحث عن شخص، استخدم الأمر `/u username`", parse_mode="Markdown")
+        await message.answer("❌ No results found.")
 
 if __name__ == '__main__':
     executor.start_polling(dp)
