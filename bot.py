@@ -169,14 +169,12 @@ async def cmd_start(msg: types.Message) -> None:
     # طلب جديد أو معلّق
     if uid not in pending_users:
         pending_users[uid] = {"name": name, "username": uname}
-        # أخبر المستخدم بالانتظار
         await msg.answer(
             "⏳ تم إرسال طلب الوصول إلى المشرف.\n"
             "سيتم إشعارك فور الموافقة.\n\n"
             f"🆔 معرّفك: <code>{uid}</code>",
             parse_mode="HTML",
         )
-        # أرسل طلب الموافقة للمشرف
         await bot.send_message(
             ADMIN_ID,
             f"🔔 <b>طلب وصول جديد</b>\n\n"
@@ -195,7 +193,6 @@ async def cmd_start(msg: types.Message) -> None:
 
 
 async def _show_welcome(msg: types.Message) -> None:
-    """يعرض رسالة الترحيب مع لوحة اللغة."""
     uid  = msg.from_user.id
     name = msg.from_user.full_name
     user_lang.setdefault(uid, "ar")
@@ -222,7 +219,6 @@ async def cb_approve_reject(call: types.CallbackQuery) -> None:
 
     if action == "approve":
         allowed_users.add(target_id)
-        # أشعر المشرف
         try:
             await call.message.edit_text(
                 f"✅ تمت الموافقة على {name} ({uname}) — <code>{target_id}</code>",
@@ -230,7 +226,6 @@ async def cb_approve_reject(call: types.CallbackQuery) -> None:
             )
         except MessageNotModified:
             pass
-        # أشعر المستخدم
         try:
             await bot.send_message(
                 target_id,
@@ -240,7 +235,6 @@ async def cb_approve_reject(call: types.CallbackQuery) -> None:
         except Exception:
             pass
     else:
-        # رفض
         try:
             await call.message.edit_text(
                 f"❌ تم رفض {name} ({uname}) — <code>{target_id}</code>",
@@ -483,12 +477,8 @@ def grep_email_pass(query: str, max_lines: int = 15) -> list[str]:
 @dp.message_handler()
 async def handle_text(msg: types.Message) -> None:
     uid = msg.from_user.id
-
-    # تجاهل غير المسموح لهم صامتاً
     if not is_allowed(uid):
         return
-
-    # إذا لم يختر وضعاً بعد
     if uid not in user_mode:
         lang = user_lang.get(uid, "ar")
         await msg.reply(
@@ -496,7 +486,6 @@ async def handle_text(msg: types.Message) -> None:
             reply_markup=main_menu(uid),
         )
         return
-
     if not is_ready:
         await msg.reply(t(uid,
             "⏳ البيانات لا تزال تُحمَّل، انتظر قليلاً ثم أعد المحاولة.",
@@ -506,14 +495,12 @@ async def handle_text(msg: types.Message) -> None:
     query = msg.text.strip().lstrip("@")
     if not query:
         return
-
     if not sanitize(query):
         await msg.reply(t(uid,
             "⚠️ الاستعلام يحتوي على رموز غير مسموح بها.",
             "⚠️ Query contains disallowed characters."))
         return
 
-    # مؤشر "جارٍ البحث …"
     wait_msg = await msg.reply(t(uid, "🔄 جارٍ البحث …", "🔄 Searching …"))
 
     mode = user_mode.get(uid, "full")
@@ -527,9 +514,7 @@ async def handle_text(msg: types.Message) -> None:
         else:
             lines = grep_full(query)
 
-        # احذف رسالة الانتظار
         await wait_msg.delete()
-
         if not lines:
             await msg.reply(
                 t(uid, "❌ لم يُعثر على نتائج.", "❌ No results found."),
@@ -537,42 +522,41 @@ async def handle_text(msg: types.Message) -> None:
             )
             return
 
-        sep    = "\n\n" if mode == "email" else "\n"
-        output = sep.join(lines)
+        processed_lines = []
+        for line in lines:
+            p = line.split(':')
+            if p and " " not in p[0] and "." not in p[0]:
+                processed_lines.append(f"{line}\n🔗 https://x.com/{p[0].strip().replace('@','')}")
+            else:
+                processed_lines.append(line)
+
+        sep    = "\n\n"
+        output = sep.join(processed_lines)
         header = t(uid, f"✅ النتائج ({len(lines)}):", f"✅ Results ({len(lines)}):")
 
         full_text = f"{header}\n\n<code>{output}</code>"
         if len(full_text) <= 4096:
             await msg.answer(full_text, parse_mode="HTML", reply_markup=_back_kb(uid))
         else:
-            # تقطيع الرسائل الطويلة
             await msg.answer(header, parse_mode="HTML")
             chunk: list[str] = []
             chunks: list[list[str]] = []
-            for line in lines:
+            for line in processed_lines:
                 chunk.append(line)
-                if len(sep.join(chunk)) > 3600:
+                if len("\n".join(chunk)) > 3800:
                     chunks.append(chunk[:-1])
                     chunk = [line]
             chunks.append(chunk)
             for i, c in enumerate(chunks):
                 kb = _back_kb(uid) if i == len(chunks) - 1 else None
-                await msg.answer(f"<code>{sep.join(c)}</code>", parse_mode="HTML", reply_markup=kb)
+                await msg.answer(f"<code>{chr(10).join(c)}</code>", parse_mode="HTML", reply_markup=kb)
 
     except subprocess.TimeoutExpired:
-        await wait_msg.delete()
         await msg.reply(t(uid, "⚠️ انتهت مهلة البحث.", "⚠️ Search timed out."))
     except Exception as exc:
         log.exception("خطأ في البحث: %s", exc)
-        try:
-            await wait_msg.delete()
-        except Exception:
-            pass
-        await msg.reply(t(uid, "⚠️ حدث خطأ أثناء البحث.", "⚠️ An error occurred."))
+        await msg.reply(t(uid, "⚠️ حدث خطأ أثناء البحث.", "⚠️ An error occurred during search."))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  نقطة الدخول
-# ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)
