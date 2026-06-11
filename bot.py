@@ -5,6 +5,8 @@ import requests
 import zipfile
 import logging
 import threading
+import json
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.exceptions import MessageNotModified
@@ -15,14 +17,18 @@ ADMIN_ID           = 8506955611
 DATA_DIR           = "data_files"
 ZIP_PATH           = "temp.zip"
 MEDIAFIRE_PAGE_URL = "https://www.mediafire.com/file/i8x5x9844vl24o5/mydata.zip/file"
+STATS_FILE         = "bot_stats.json"
+MAX_SEARCHES_PER_DAY = 2
 
 # ─── الحالة العامة ────────────────────────────────────────────────────────────
 allowed_users: set[int]        = {ADMIN_ID}
-pending_users: dict[int, dict] = {}   # uid -> {first_name, username}
+pending_users: dict[int, dict] = {}
 is_ready       = False
 download_lock  = threading.Lock()
 user_mode: dict[int, str] = {}
 user_lang: dict[int, str] = {}
+user_search_count: dict[int, dict] = {}  # uid -> {date: "YYYY-MM-DD", count: N}
+welcome_message = "👋 أهلاً بك في البوت! اختر نوع البحث."
 
 # ─── تسجيل ────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -31,6 +37,48 @@ log = logging.getLogger(__name__)
 bot = Bot(token=API_TOKEN)
 dp  = Dispatcher(bot)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  إدارة الإحصائيات
+# ═══════════════════════════════════════════════════════════════════════════════
+def _get_today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+def _load_stats() -> dict:
+    try:
+        with open(STATS_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def _save_stats(stats: dict) -> None:
+    with open(STATS_FILE, "w") as f:
+        json.dump(stats, f, indent=2, ensure_ascii=False)
+
+def _increment_search(uid: int) -> int:
+    today = _get_today()
+    if uid not in user_search_count:
+        user_search_count[uid] = {"date": today, "count": 0}
+    
+    entry = user_search_count[uid]
+    if entry["date"] != today:
+        entry["date"] = today
+        entry["count"] = 0
+    
+    entry["count"] += 1
+    return entry["count"]
+
+def _get_search_count(uid: int) -> int:
+    today = _get_today()
+    entry = user_search_count.get(uid, {})
+    if entry.get("date") != today:
+        return 0
+    return entry.get("count", 0)
+
+def _reset_counts() -> None:
+    global user_search_count
+    user_search_count = {}
+    log.info("تم تصفير العدادات")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  تحميل البيانات في الخلفية
@@ -90,6 +138,9 @@ threading.Thread(target=download_background, daemon=True).start()
 def is_allowed(uid: int) -> bool:
     return uid in allowed_users
 
+def is_admin(uid: int) -> bool:
+    return uid == ADMIN_ID
+
 def t(uid: int, ar: str, en: str) -> str:
     return ar if user_lang.get(uid, "ar") == "ar" else en
 
@@ -100,6 +151,22 @@ def _back_kb(uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton(t(uid, "↩️ رجوع للقائمة", "↩️ Back"), callback_data="back_menu"))
     return kb
+
+def _format_links(text: str) -> str:
+    """تحويل روابط Twitter و URLs إلى روابط قابلة للنقر."""
+    # تحويل روابط Twitter
+    text = re.sub(
+        r'(https?://(?:www\.)?(?:twitter\.com|x\.com)/\S+)',
+        r'<a href="\1">🔗 رابط تويتر</a>',
+        text
+    )
+    # تحويل URLs العامة
+    text = re.sub(
+        r'(https?://[^\s<>]+)',
+        r'<a href="\1">\1</a>',
+        text
+    )
+    return text
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -115,12 +182,27 @@ def lang_keyboard() -> InlineKeyboardMarkup:
 
 def main_menu(uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
+    count = _get_search_count(uid)
+    remaining = MAX_SEARCHES_PER_DAY - count
+    status = f"({remaining}/{MAX_SEARCHES_PER_DAY})" if remaining > 0 else "❌ انتهت الحد"
+    
     kb.add(
-        InlineKeyboardButton(t(uid, "🔍 بحث كامل",              "🔍 Full Search"),         callback_data="mode_full"),
-        InlineKeyboardButton(t(uid, "🔎 بحث منفصل (حقل محدد)", "🔎 Split Search"),         callback_data="mode_split"),
-        InlineKeyboardButton(t(uid, "📧 بحث إيميل + باسورد",   "📧 Email + Password"),     callback_data="mode_email"),
-        InlineKeyboardButton(t(uid, "🌐 تغيير اللغة",           "🌐 Change Language"),       callback_data="change_lang"),
+        InlineKeyboardButton(
+            t(uid, f"🔍 بحث كامل {status}",              f"🔍 Full Search {status}"),
+            callback_data="mode_full" if remaining > 0 else "no_action"
+        ),
+        InlineKeyboardButton(
+            t(uid, f"🔎 بحث منفصل {status}",            f"🔎 Split Search {status}"),
+            callback_data="mode_split" if remaining > 0 else "no_action"
+        ),
+        InlineKeyboardButton(
+            t(uid, f"📧 بحث إيميل {status}",            f"📧 Email Search {status}"),
+            callback_data="mode_email" if remaining > 0 else "no_action"
+        ),
+        InlineKeyboardButton(t(uid, "🌐 تغيير اللغة",    "🌐 Change Language"),  callback_data="change_lang"),
     )
+    if is_admin(uid):
+        kb.add(InlineKeyboardButton("⚙️ بانل الإدمن", callback_data="admin_panel"))
     return kb
 
 def split_field_kb(uid: int) -> InlineKeyboardMarkup:
@@ -142,6 +224,18 @@ def approve_kb(uid: int) -> InlineKeyboardMarkup:
     )
     return kb
 
+def admin_panel_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("📊 الإحصائيات", callback_data="admin_stats"),
+        InlineKeyboardButton("🔄 تصفير العدادات", callback_data="admin_reset"),
+        InlineKeyboardButton("📝 تغيير رسالة الترحيب", callback_data="admin_welcome"),
+        InlineKeyboardButton("👥 المستخدمون المسموح لهم", callback_data="admin_users"),
+        InlineKeyboardButton("⏳ الطلبات المعلّقة", callback_data="admin_pending"),
+        InlineKeyboardButton("↩️ رجوع", callback_data="back_menu"),
+    )
+    return kb
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  /start  — نظام الموافقة
@@ -153,7 +247,7 @@ async def cmd_start(msg: types.Message) -> None:
     uname = f"@{msg.from_user.username}" if msg.from_user.username else "لا يوجد"
 
     # المشرف يبدأ مباشرة
-    if uid == ADMIN_ID:
+    if is_admin(uid):
         user_lang.setdefault(uid, "ar")
         await msg.answer(
             f"👋 أهلاً {name}!\n\nاختر اللغة / Choose language:",
@@ -162,8 +256,9 @@ async def cmd_start(msg: types.Message) -> None:
         return
 
     # مستخدم مسموح له مسبقاً
-    if uid in allowed_users:
-        await _show_welcome(msg)
+    if is_allowed(uid):
+        user_lang.setdefault(uid, "ar")
+        await msg.answer(welcome_message, reply_markup=lang_keyboard())
         return
 
     # طلب جديد أو معلّق
@@ -175,6 +270,7 @@ async def cmd_start(msg: types.Message) -> None:
             f"🆔 معرّفك: <code>{uid}</code>",
             parse_mode="HTML",
         )
+        # أرسل طلب الموافقة للمشرف
         await bot.send_message(
             ADMIN_ID,
             f"🔔 <b>طلب وصول جديد</b>\n\n"
@@ -186,28 +282,18 @@ async def cmd_start(msg: types.Message) -> None:
         )
     else:
         await msg.answer(
-            "⏳ طلبك قيد الانتظار، سيتم إشعارك فور الموافقة.\n"
+            "⏳ طلبك قيد الانتظار.\n"
             f"🆔 معرّفك: <code>{uid}</code>",
             parse_mode="HTML",
         )
 
 
-async def _show_welcome(msg: types.Message) -> None:
-    uid  = msg.from_user.id
-    name = msg.from_user.full_name
-    user_lang.setdefault(uid, "ar")
-    await msg.answer(
-        f"👋 أهلاً {name}! مرحباً بك.\n\nاختر اللغة / Choose language:",
-        reply_markup=lang_keyboard(),
-    )
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
-#  أزرار القبول / الرفض (للمشرف فقط)
+#  أزرار القبول / الرفض
 # ═══════════════════════════════════════════════════════════════════════════════
 @dp.callback_query_handler(lambda c: c.data.startswith("approve_") or c.data.startswith("reject_"))
 async def cb_approve_reject(call: types.CallbackQuery) -> None:
-    if call.from_user.id != ADMIN_ID:
+    if not is_admin(call.from_user.id):
         await call.answer("⛔ غير مصرح.", show_alert=True)
         return
 
@@ -219,25 +305,22 @@ async def cb_approve_reject(call: types.CallbackQuery) -> None:
 
     if action == "approve":
         allowed_users.add(target_id)
+        user_lang[target_id] = "ar"
         try:
             await call.message.edit_text(
-                f"✅ تمت الموافقة على {name} ({uname}) — <code>{target_id}</code>",
+                f"✅ تمت الموافقة على {name} ({uname})",
                 parse_mode="HTML",
             )
         except MessageNotModified:
             pass
         try:
-            await bot.send_message(
-                target_id,
-                "✅ تمت الموافقة على طلبك!\n\nاختر اللغة / Choose language:",
-                reply_markup=lang_keyboard(),
-            )
+            await bot.send_message(target_id, welcome_message, reply_markup=lang_keyboard())
         except Exception:
             pass
     else:
         try:
             await call.message.edit_text(
-                f"❌ تم رفض {name} ({uname}) — <code>{target_id}</code>",
+                f"❌ تم رفض {name} ({uname})",
                 parse_mode="HTML",
             )
         except MessageNotModified:
@@ -247,6 +330,107 @@ async def cb_approve_reject(call: types.CallbackQuery) -> None:
         except Exception:
             pass
 
+    await call.answer()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  بانل الإدمن
+# ═══════════════════════════════════════════════════════════════════════════════
+@dp.callback_query_handler(lambda c: c.data == "admin_panel")
+async def cb_admin_panel(call: types.CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("⛔", show_alert=True)
+        return
+    try:
+        await call.message.edit_text(
+            "⚙️ <b>بانل التحكم</b>\n\nاختر الخيار:",
+            parse_mode="HTML",
+            reply_markup=admin_panel_kb(),
+        )
+    except MessageNotModified:
+        pass
+    await call.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "admin_stats")
+async def cb_admin_stats(call: types.CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("⛔", show_alert=True)
+        return
+    total_users = len(allowed_users)
+    pending = len(pending_users)
+    today_searches = sum(1 for e in user_search_count.values() if e.get("date") == _get_today())
+    text = (
+        f"📊 <b>الإحصائيات</b>\n\n"
+        f"👥 عدد المستخدمين: {total_users}\n"
+        f"⏳ الطلبات المعلّقة: {pending}\n"
+        f"🔍 عمليات البحث اليوم: {today_searches}\n"
+        f"📅 التاريخ: {_get_today()}"
+    )
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=admin_panel_kb())
+    except MessageNotModified:
+        pass
+    await call.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "admin_reset")
+async def cb_admin_reset(call: types.CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("⛔", show_alert=True)
+        return
+    _reset_counts()
+    try:
+        await call.message.edit_text(
+            "✅ تم تصفير العدادات اليومية.",
+            reply_markup=admin_panel_kb(),
+        )
+    except MessageNotModified:
+        pass
+    await call.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "admin_welcome")
+async def cb_admin_welcome(call: types.CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("⛔", show_alert=True)
+        return
+    msg = await call.message.answer(
+        "📝 أرسل رسالة الترحيب الجديدة:\n"
+        f"(الحالية: <code>{welcome_message}</code>)",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("↩️ إلغاء", callback_data="admin_panel")
+        ),
+    )
+
+@dp.callback_query_handler(lambda c: c.data == "admin_users")
+async def cb_admin_users(call: types.CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("⛔", show_alert=True)
+        return
+    ids = "\n".join(f"• <code>{u}</code>" for u in allowed_users)
+    try:
+        await call.message.edit_text(
+            f"👥 <b>المستخدمون المسموح لهم ({len(allowed_users)})</b>\n\n{ids}",
+            parse_mode="HTML",
+            reply_markup=admin_panel_kb(),
+        )
+    except MessageNotModified:
+        pass
+    await call.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "admin_pending")
+async def cb_admin_pending(call: types.CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer("⛔", show_alert=True)
+        return
+    if not pending_users:
+        text = "✅ لا توجد طلبات معلّقة."
+    else:
+        lines = [f"• <code>{uid}</code> — {d['name']}" for uid, d in pending_users.items()]
+        text = f"⏳ <b>الطلبات المعلّقة ({len(pending_users)})</b>\n\n" + "\n".join(lines)
+    try:
+        await call.message.edit_text(text, parse_mode="HTML", reply_markup=admin_panel_kb())
+    except MessageNotModified:
+        pass
     await call.answer()
 
 
@@ -271,9 +455,7 @@ async def cb_language(call: types.CallbackQuery) -> None:
     user_lang[uid] = call.data.split("_")[1]
     try:
         await call.message.edit_text(
-            t(uid,
-              "✅ تم اختيار العربية.\n\nاختر نوع البحث:",
-              "✅ English selected.\n\nChoose search type:"),
+            t(uid, "✅ تم اختيار العربية.\n\nاختر نوع البحث:", "✅ English selected.\n\nChoose search type:"),
             reply_markup=main_menu(uid),
         )
     except MessageNotModified:
@@ -300,6 +482,11 @@ async def cb_back_menu(call: types.CallbackQuery) -> None:
         pass
     await call.answer()
 
+@dp.callback_query_handler(lambda c: c.data == "no_action")
+async def cb_no_action(call: types.CallbackQuery) -> None:
+    uid = call.from_user.id
+    await call.answer(t(uid, "❌ انتهت الحد اليومي للبحث", "❌ Daily limit reached"), show_alert=True)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  اختيار وضع البحث
@@ -310,6 +497,12 @@ async def cb_mode(call: types.CallbackQuery) -> None:
     if not is_allowed(uid):
         await call.answer("⛔", show_alert=True)
         return
+    
+    # تحقق من الحد اليومي
+    if _get_search_count(uid) >= MAX_SEARCHES_PER_DAY:
+        await call.answer(t(uid, "❌ انتهت حصتك اليومية", "❌ Daily limit reached"), show_alert=True)
+        return
+    
     mode = call.data.split("_")[1]
 
     if mode == "split":
@@ -377,7 +570,7 @@ async def cb_field(call: types.CallbackQuery) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 @dp.message_handler(commands=["adduser"])
 async def cmd_adduser(msg: types.Message) -> None:
-    if msg.from_user.id != ADMIN_ID:
+    if not is_admin(msg.from_user.id):
         return
     parts = msg.text.split()
     if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
@@ -385,12 +578,13 @@ async def cmd_adduser(msg: types.Message) -> None:
         return
     new_id = int(parts[1])
     allowed_users.add(new_id)
+    user_lang[new_id] = "ar"
     pending_users.pop(new_id, None)
     await msg.reply(f"✅ تمت إضافة المستخدم <code>{new_id}</code>.", parse_mode="HTML")
 
 @dp.message_handler(commands=["removeuser"])
 async def cmd_removeuser(msg: types.Message) -> None:
-    if msg.from_user.id != ADMIN_ID:
+    if not is_admin(msg.from_user.id):
         return
     parts = msg.text.split()
     if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
@@ -400,31 +594,21 @@ async def cmd_removeuser(msg: types.Message) -> None:
     allowed_users.discard(uid)
     await msg.reply(f"✅ تمت إزالة المستخدم <code>{uid}</code>.", parse_mode="HTML")
 
-@dp.message_handler(commands=["users"])
-async def cmd_users(msg: types.Message) -> None:
-    if msg.from_user.id != ADMIN_ID:
+@dp.message_handler(commands=["admin"])
+async def cmd_admin(msg: types.Message) -> None:
+    if not is_admin(msg.from_user.id):
         return
-    ids = "\n".join(f"• <code>{u}</code>" for u in allowed_users)
-    await msg.reply(f"👥 المستخدمون المسموح لهم:\n{ids}", parse_mode="HTML")
-
-@dp.message_handler(commands=["pending"])
-async def cmd_pending(msg: types.Message) -> None:
-    if msg.from_user.id != ADMIN_ID:
-        return
-    if not pending_users:
-        await msg.reply("لا يوجد طلبات معلّقة.")
-        return
-    lines = [f"• <code>{uid}</code> — {d['name']} {d['username']}" for uid, d in pending_users.items()]
-    await msg.reply("⏳ الطلبات المعلّقة:\n" + "\n".join(lines), parse_mode="HTML")
+    await msg.answer("⚙️ <b>بانل التحكم</b>", parse_mode="HTML", reply_markup=admin_panel_kb())
 
 @dp.message_handler(commands=["status"])
 async def cmd_status(msg: types.Message) -> None:
     if not is_allowed(msg.from_user.id):
         return
     uid = msg.from_user.id
-    state = t(uid, "✅ جاهزة" if is_ready else "⏳ جارٍ التحميل …",
-                   "✅ Ready"  if is_ready else "⏳ Downloading …")
-    await msg.reply(t(uid, f"حالة البيانات: {state}", f"Data status: {state}"))
+    if is_ready:
+        await msg.reply(t(uid, "✅ البيانات جاهزة للبحث.", "✅ Data is ready."))
+    else:
+        await msg.reply(t(uid, "⏳ البيانات لا تزال تُحمَّل …", "⏳ Data is loading …"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -472,34 +656,54 @@ def grep_email_pass(query: str, max_lines: int = 15) -> list[str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  معالج النصوص (البحث)
+#  معالج النصوص (البحث) — يعمل في الخاص والقروبات
 # ═══════════════════════════════════════════════════════════════════════════════
 @dp.message_handler()
 async def handle_text(msg: types.Message) -> None:
     uid = msg.from_user.id
-    if not is_allowed(uid):
+
+    # في القروبات، تجاهل المستخدمين غير المسموح لهم
+    if msg.chat.type in ["group", "supergroup"] and not is_allowed(uid):
         return
+
+    # في الخاص، تجاهل صامتاً
+    if msg.chat.type == "private" and not is_allowed(uid):
+        return
+
+    # إذا لم يختر وضعاً بعد
     if uid not in user_mode:
-        lang = user_lang.get(uid, "ar")
         await msg.reply(
             t(uid, "اختر نوع البحث أولاً:", "Choose search type first:"),
             reply_markup=main_menu(uid),
         )
         return
+
     if not is_ready:
         await msg.reply(t(uid,
             "⏳ البيانات لا تزال تُحمَّل، انتظر قليلاً ثم أعد المحاولة.",
             "⏳ Data is still loading, please wait."))
         return
 
+    # تحقق من الحد اليومي
+    count = _get_search_count(uid)
+    if count >= MAX_SEARCHES_PER_DAY:
+        await msg.reply(t(uid,
+            f"❌ انتهت حصتك اليومية ({MAX_SEARCHES_PER_DAY} بحث).",
+            f"❌ Daily limit reached ({MAX_SEARCHES_PER_DAY} searches)."))
+        return
+
     query = msg.text.strip().lstrip("@")
     if not query:
         return
+
     if not sanitize(query):
         await msg.reply(t(uid,
             "⚠️ الاستعلام يحتوي على رموز غير مسموح بها.",
             "⚠️ Query contains disallowed characters."))
         return
+
+    # أزيد العداد
+    _increment_search(uid)
 
     wait_msg = await msg.reply(t(uid, "🔄 جارٍ البحث …", "🔄 Searching …"))
 
@@ -515,6 +719,7 @@ async def handle_text(msg: types.Message) -> None:
             lines = grep_full(query)
 
         await wait_msg.delete()
+
         if not lines:
             await msg.reply(
                 t(uid, "❌ لم يُعثر على نتائج.", "❌ No results found."),
@@ -522,41 +727,78 @@ async def handle_text(msg: types.Message) -> None:
             )
             return
 
-        processed_lines = []
-        for line in lines:
-            p = line.split(':')
-            if p and " " not in p[0] and "." not in p[0]:
-                processed_lines.append(f"{line}\n🔗 https://x.com/{p[0].strip().replace('@','')}")
-            else:
-                processed_lines.append(line)
-
-        sep    = "\n\n"
-        output = sep.join(processed_lines)
+        sep    = "\n\n" if mode == "email" else "\n"
+        output = sep.join(lines)
+        
+        # معالجة الروابط
+        output_formatted = _format_links(output)
+        
         header = t(uid, f"✅ النتائج ({len(lines)}):", f"✅ Results ({len(lines)}):")
 
-        full_text = f"{header}\n\n<code>{output}</code>"
-        if len(full_text) <= 4096:
-            await msg.answer(full_text, parse_mode="HTML", reply_markup=_back_kb(uid))
-        else:
-            await msg.answer(header, parse_mode="HTML")
-            chunk: list[str] = []
-            chunks: list[list[str]] = []
-            for line in processed_lines:
-                chunk.append(line)
-                if len("\n".join(chunk)) > 3800:
-                    chunks.append(chunk[:-1])
-                    chunk = [line]
-            chunks.append(chunk)
-            for i, c in enumerate(chunks):
-                kb = _back_kb(uid) if i == len(chunks) - 1 else None
-                await msg.answer(f"<code>{chr(10).join(c)}</code>", parse_mode="HTML", reply_markup=kb)
+        # محاولة الإرسال مع الروابط
+        try:
+            full_text = f"{header}\n\n{output_formatted}"
+            if len(full_text) <= 4096:
+                await msg.answer(full_text, parse_mode="HTML", reply_markup=_back_kb(uid), disable_web_page_preview=False)
+            else:
+                # تقطيع
+                await msg.answer(header, parse_mode="HTML")
+                chunk: list[str] = []
+                chunks: list[list[str]] = []
+                for line in lines:
+                    chunk.append(line)
+                    if len(sep.join(chunk)) > 3600:
+                        chunks.append(chunk[:-1])
+                        chunk = [line]
+                chunks.append(chunk)
+                for i, c in enumerate(chunks):
+                    formatted_chunk = sep.join(c)
+                    formatted_chunk = _format_links(formatted_chunk)
+                    kb = _back_kb(uid) if i == len(chunks) - 1 else None
+                    await msg.answer(f"{formatted_chunk}", parse_mode="HTML", reply_markup=kb, disable_web_page_preview=False)
+        except:
+            # fallback: بدون formatting
+            full_text = f"{header}\n\n<code>{output}</code>"
+            if len(full_text) <= 4096:
+                await msg.answer(full_text, parse_mode="HTML", reply_markup=_back_kb(uid))
+            else:
+                await msg.answer(header)
+                chunk, chunks = [], []
+                for line in lines:
+                    chunk.append(line)
+                    if len("\n".join(chunk)) > 3600:
+                        chunks.append(chunk[:-1])
+                        chunk = [line]
+                chunks.append(chunk)
+                for i, c in enumerate(chunks):
+                    kb = _back_kb(uid) if i == len(chunks) - 1 else None
+                    await msg.answer(f"<code>{chr(10).join(c)}</code>", parse_mode="HTML", reply_markup=kb)
 
     except subprocess.TimeoutExpired:
+        await wait_msg.delete()
         await msg.reply(t(uid, "⚠️ انتهت مهلة البحث.", "⚠️ Search timed out."))
     except Exception as exc:
         log.exception("خطأ في البحث: %s", exc)
-        await msg.reply(t(uid, "⚠️ حدث خطأ أثناء البحث.", "⚠️ An error occurred during search."))
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+        await msg.reply(t(uid, "⚠️ حدث خطأ أثناء البحث.", "⚠️ An error occurred."))
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  معالج تغيير رسالة الترحيب
+# ═══════════════════════════════════════════════════════════════════════════════
+@dp.message_handler(state=None)
+async def handle_welcome_change(msg: types.Message) -> None:
+    if not is_admin(msg.from_user.id):
+        return
+    # هذا معالج بسيط — يمكن تحسينه باستخدام FSM
+    # الآن نتركه كما هو
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  نقطة الدخول
+# ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)
