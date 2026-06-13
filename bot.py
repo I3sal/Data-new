@@ -8,7 +8,7 @@ from aiogram.utils.exceptions import MessageNotModified
 # ── إعدادات ───────────────────────────────────────────────────────────────────
 TOKEN         = os.environ.get("BOT_TOKEN", "8723495517:AAEFsdiG0DR6NK8BHpwhVmATSlTVgkJah6o")
 ADMIN_ID      = int(os.environ.get("ADMIN_ID", "8506955611"))
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")   # ضعه في Railway Variables
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", os.environ.get("AI", ""))   # ضعه في Railway Variables
 DATA_DIR      = "data_files"
 ZIP_PATH      = "temp.zip"
 MF_URL        = "https://www.mediafire.com/file/i8x5x9844vl24o5/mydata.zip/file"
@@ -473,9 +473,13 @@ async def h_text(msg: types.Message):
     if any(c in query for c in ('"',";","&","|","`","$","\\","\n")):
         return await msg.reply("⚠️ رموز غير مسموح بها.")
 
+    # إذا لم يختر وضعاً → أظهر القائمة
+    if uid not in mode_map:
+        return await msg.answer("اختر نوع البحث أولاً:", reply_markup=kb_main(uid))
+
     if not adm(uid): inc(uid)
 
-    mode = mode_map.get(uid, "full")
+    mode = mode_map[uid]
     wait = await msg.reply("🔄 جارٍ البحث …")
 
     try:
