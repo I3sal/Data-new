@@ -1,3 +1,4 @@
+import asyncio
 import os, re, requests, zipfile, logging, threading, subprocess
 from datetime import datetime
 from aiogram import Bot, Dispatcher, executor, types
@@ -5,18 +6,20 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.exceptions import MessageNotModified
 
 # ── إعدادات ───────────────────────────────────────────────────────────────────
-TOKEN         = "8723495517:AAEFsdiG0DR6NK8BHpwhVmATSlTVgkJah6o"
-ADMIN_ID      = 8506955611
+TOKEN         = os.environ.get("BOT_TOKEN", "8723495517:AAEFsdiG0DR6NK8BHpwhVmATSlTVgkJah6o")
+ADMIN_ID      = int(os.environ.get("ADMIN_ID", "8506955611"))
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")   # ضعه في Railway Variables
 DATA_DIR      = "data_files"
 ZIP_PATH      = "temp.zip"
 MF_URL        = "https://www.mediafire.com/file/i8x5x9844vl24o5/mydata.zip/file"
-MAX_DAY       = 2           # حد البحث اليومي للمستخدمين
+MAX_DAY       = 2
 
 # ── حالة ──────────────────────────────────────────────────────────────────────
 allowed   : set[int]        = {ADMIN_ID}
-pending   : dict[int, dict] = {}   # uid → {name, username}
-mode_map  : dict[int, str]  = {}   # uid → وضع البحث الحالي
-counts    : dict[int, dict] = {}   # uid → {date, n}
+pending   : dict[int, dict] = {}
+mode_map  : dict[int, str]  = {}
+counts    : dict[int, dict] = {}
+ai_hist   : dict[int, list] = {}   # سجل محادثة AI لكل مستخدم
 welcome   = ["👋 أهلاً بك! اختر نوع البحث."]
 is_ready  = False
 
@@ -27,12 +30,12 @@ bot = Bot(token=TOKEN, parse_mode="HTML")
 dp  = Dispatcher(bot)
 
 # ── مساعدات ───────────────────────────────────────────────────────────────────
-def today():             return datetime.now().strftime("%Y-%m-%d")
-def adm(uid):            return uid == ADMIN_ID
-def ok(uid):             return uid in allowed
-def esc(s):              return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+def today():            return datetime.now().strftime("%Y-%m-%d")
+def adm(uid):           return uid == ADMIN_ID
+def ok(uid):            return uid in allowed
+def esc(s):             return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 def day_count(uid):
-    e = counts.get(uid, {}); return e.get("n",0) if e.get("d")==today() else 0
+    e = counts.get(uid,{}); return e.get("n",0) if e.get("d")==today() else 0
 def inc(uid):
     e = counts.setdefault(uid,{"d":today(),"n":0})
     if e["d"]!=today(): e["d"],e["n"]=today(),0
@@ -51,7 +54,7 @@ def resolve_mf():
     html = requests.get(MF_URL, timeout=30).text
     m = re.search(r'id=["\']downloadButton["\'][^>]*href=["\']([^"\']+)["\']', html) or \
         re.search(r'href=["\']([^"\']+)["\'][^>]*id=["\']downloadButton["\']', html)
-    if not m: raise ValueError("لم يُعثر على رابط التحميل")
+    if not m: raise ValueError("لم يُعثر على رابط")
     return m.group(1)
 
 def dl_thread():
@@ -62,7 +65,7 @@ def dl_thread():
     os.makedirs(DATA_DIR, exist_ok=True)
     try:
         url = resolve_mf()
-        log.info("تحميل من: %s", url)
+        log.info("تحميل: %s", url)
         with requests.get(url, stream=True, timeout=300) as r:
             r.raise_for_status()
             total, done = int(r.headers.get("content-length",0)), 0
@@ -75,42 +78,38 @@ def dl_thread():
         os.remove(ZIP_PATH)
         is_ready = True; log.info("✅ جاهز")
     except Exception as ex:
-        log.exception("فشل التحميل: %s", ex)
+        log.exception("فشل: %s", ex)
         if os.path.exists(ZIP_PATH): os.remove(ZIP_PATH)
 
 threading.Thread(target=dl_thread, daemon=True).start()
 
-# ── البحث (grep streaming بدون RAM) ───────────────────────────────────────────
-def do_grep(query: str, n=15) -> list[str]:
-    """grep سريع streaming — لا يحمل شيئاً في الذاكرة"""
-    safe = query.replace("'", "")           # تنظيف بسيط
+# ── البحث ─────────────────────────────────────────────────────────────────────
+def do_grep(q, n=15):
     try:
-        p = subprocess.Popen(
-            ["grep","-rFih","--",safe,DATA_DIR],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-        results = []
+        p = subprocess.Popen(["grep","-rFih","--",q,DATA_DIR],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        res = []
         for raw in p.stdout:
             line = raw.decode("utf-8","ignore").strip()
-            if line: results.append(line)
-            if len(results) >= n: break
+            if line: res.append(line)
+            if len(res) >= n: break
         p.kill(); p.wait()
-        return results
+        return res
     except Exception as ex:
-        log.exception("grep: %s", ex); return []
+        log.exception(ex); return []
 
 def search_full(q):  return do_grep(q)
 
 def search_split(q, field):
     fidx = {"user":0,"email":1,"password":2,"phone":3,"id":4}
-    idx  = fidx.get(field, 0)
+    idx  = fidx.get(field,0)
     raw  = do_grep(q, 60)
     out  = []
     for line in raw:
         parts = re.split(r"[:|]", line)
-        if len(parts) > idx and q.lower() in parts[idx].lower():
+        if len(parts)>idx and q.lower() in parts[idx].lower():
             out.append(line)
-        if len(out) >= 15: break
+        if len(out)>=15: break
     return out
 
 def search_email(q):
@@ -120,8 +119,53 @@ def search_email(q):
     for line in raw:
         m = pat.search(line)
         if m: out.append(f"📧 {m.group(1)}\n🔑 {m.group(2)}")
-        if len(out) >= 15: break
+        if len(out)>=15: break
     return out
+
+# ── الذكاء الاصطناعي ───────────────────────────────────────────────────────────
+def ask_claude(uid: int, user_msg: str) -> str:
+    """إرسال رسالة لـ Claude والحصول على رد"""
+    if not ANTHROPIC_KEY:
+        return "⚠️ لم يتم إعداد الذكاء الاصطناعي. أضف ANTHROPIC_KEY في Railway Variables."
+
+    # سجل المحادثة (آخر 10 رسائل فقط لتوفير التكلفة)
+    history = ai_hist.setdefault(uid, [])
+    history.append({"role": "user", "content": user_msg})
+    if len(history) > 20:
+        history = history[-20:]
+        ai_hist[uid] = history
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 1024,
+                "system": (
+                    "أنت مساعد ذكي داخل بوت تيليغرام. "
+                    "أجب بالعربية دائماً ما لم يتحدث المستخدم بلغة أخرى. "
+                    "كن مختصراً ومفيداً. لا تتجاوز 300 كلمة في الرد."
+                ),
+                "messages": history,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        reply = data["content"][0]["text"]
+        # أضف رد المساعد للسجل
+        history.append({"role": "assistant", "content": reply})
+        return reply
+    except requests.exceptions.Timeout:
+        return "⚠️ انتهت مهلة الاتصال بالذكاء الاصطناعي، حاول مجدداً."
+    except Exception as ex:
+        log.exception("Claude error: %s", ex)
+        return "⚠️ حدث خطأ في الذكاء الاصطناعي."
 
 # ── لوحات مفاتيح ──────────────────────────────────────────────────────────────
 def kb_req(uid):
@@ -136,26 +180,34 @@ def kb_main(uid):
     on   = left > 0
     k = InlineKeyboardMarkup(row_width=1)
     k.add(
-        InlineKeyboardButton(f"🔍 بحث كامل{suf}",       callback_data="M_full"  if on else "nop"),
-        InlineKeyboardButton(f"🔎 بحث منفصل{suf}",      callback_data="M_split" if on else "nop"),
-        InlineKeyboardButton(f"📧 إيميل + باسورد{suf}", callback_data="M_email" if on else "nop"),
-        InlineKeyboardButton("🌐 اللغة",                 callback_data="LANG"),
+        InlineKeyboardButton(f"🔍 بحث كامل{suf}",        callback_data="M_full"  if on else "nop"),
+        InlineKeyboardButton(f"🔎 بحث منفصل{suf}",       callback_data="M_split" if on else "nop"),
+        InlineKeyboardButton(f"📧 إيميل + باسورد{suf}",  callback_data="M_email" if on else "nop"),
+        InlineKeyboardButton("🤖 محادثة AI",              callback_data="M_ai"),
+        InlineKeyboardButton("🌐 اللغة",                  callback_data="LANG"),
     )
-    if adm(uid): k.add(InlineKeyboardButton("⚙️ بانل الإدمن", callback_data="ADMIN"))
+    if adm(uid):
+        k.add(InlineKeyboardButton("⚙️ بانل الإدمن", callback_data="ADMIN"))
     return k
 
 def kb_split():
     k = InlineKeyboardMarkup(row_width=2)
-    k.add(InlineKeyboardButton("👤 اليوزر",    callback_data="F_user"),
-          InlineKeyboardButton("📧 الإيميل",   callback_data="F_email"),
-          InlineKeyboardButton("📱 الهاتف",    callback_data="F_phone"),
-          InlineKeyboardButton("🆔 الآيدي",    callback_data="F_id"),
-          InlineKeyboardButton("↩️ رجوع",      callback_data="BACK"))
+    k.add(InlineKeyboardButton("👤 اليوزر",  callback_data="F_user"),
+          InlineKeyboardButton("📧 الإيميل", callback_data="F_email"),
+          InlineKeyboardButton("📱 الهاتف",  callback_data="F_phone"),
+          InlineKeyboardButton("🆔 الآيدي",  callback_data="F_id"),
+          InlineKeyboardButton("↩️ رجوع",    callback_data="BACK"))
     return k
 
-def kb_back(): 
+def kb_back():
     k = InlineKeyboardMarkup()
     k.add(InlineKeyboardButton("↩️ رجوع للقائمة", callback_data="BACK"))
+    return k
+
+def kb_ai(uid):
+    k = InlineKeyboardMarkup(row_width=1)
+    k.add(InlineKeyboardButton("🗑️ مسح المحادثة", callback_data="AI_clear"),
+          InlineKeyboardButton("↩️ رجوع للقائمة", callback_data="BACK"))
     return k
 
 def kb_lang():
@@ -166,12 +218,12 @@ def kb_lang():
 
 def kb_admin():
     k = InlineKeyboardMarkup(row_width=1)
-    k.add(InlineKeyboardButton("📊 إحصائيات",            callback_data="A_stats"),
-          InlineKeyboardButton("🔄 تصفير العدادات",       callback_data="A_reset"),
-          InlineKeyboardButton("📝 رسالة الترحيب",        callback_data="A_welcome"),
-          InlineKeyboardButton("👥 المستخدمون",            callback_data="A_users"),
-          InlineKeyboardButton("⏳ الطلبات المعلّقة",      callback_data="A_pending"),
-          InlineKeyboardButton("↩️ رجوع",                 callback_data="BACK"))
+    k.add(InlineKeyboardButton("📊 إحصائيات",           callback_data="A_stats"),
+          InlineKeyboardButton("🔄 تصفير العدادات",      callback_data="A_reset"),
+          InlineKeyboardButton("📝 رسالة الترحيب",       callback_data="A_welcome"),
+          InlineKeyboardButton("👥 المستخدمون",           callback_data="A_users"),
+          InlineKeyboardButton("⏳ الطلبات المعلّقة",     callback_data="A_pending"),
+          InlineKeyboardButton("↩️ رجوع",                callback_data="BACK"))
     return k
 
 # ── /start ─────────────────────────────────────────────────────────────────────
@@ -181,7 +233,7 @@ async def h_start(msg: types.Message):
     name  = msg.from_user.full_name
     uname = f"@{msg.from_user.username}" if msg.from_user.username else "—"
 
-    if ok(uid):                              # ← مسموح له → القائمة مباشرة
+    if ok(uid):
         return await msg.answer(welcome[0], reply_markup=kb_main(uid))
 
     if uid not in pending:
@@ -200,12 +252,11 @@ async def h_req(call: types.CallbackQuery):
     act = call.data[:2]
     uid = int(call.data[3:])
     inf = pending.pop(uid, {})
-    n   = esc(inf.get("name","؟"))
-    u   = esc(inf.get("username","—"))
+    n, u = esc(inf.get("name","؟")), esc(inf.get("username","—"))
     if act == "OK":
-        allowed.add(uid)                            # ← إضافة فورية
+        allowed.add(uid)
         await try_edit(call.message, f"✅ قُبل: {n} ({u})")
-        await notify(uid, f"✅ تمت الموافقة على طلبك!\n\n{welcome[0]}", reply_markup=kb_main(uid))
+        await notify(uid, f"✅ تمت الموافقة!\n\n{welcome[0]}", reply_markup=kb_main(uid))
     else:
         await try_edit(call.message, f"❌ رُفض: {n} ({u})")
         await notify(uid, "❌ تم رفض طلبك.")
@@ -225,7 +276,7 @@ async def h_back(call: types.CallbackQuery):
 async def h_nop(call: types.CallbackQuery):
     await call.answer("❌ انتهت حصتك اليومية", show_alert=True)
 
-# ── اللغة ──────────────────────────────────────────────────────────────────────
+# ── LANG ───────────────────────────────────────────────────────────────────────
 @dp.callback_query_handler(lambda c: c.data == "LANG")
 async def h_lang(call: types.CallbackQuery):
     if not ok(call.from_user.id): return await call.answer("⛔",show_alert=True)
@@ -234,8 +285,31 @@ async def h_lang(call: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("LG_"))
 async def h_setlang(call: types.CallbackQuery):
-    # البوت عربي فقط حالياً — زر ديكور فقط
     await try_edit(call.message, "اختر نوع البحث:", kb_main(call.from_user.id))
+    await call.answer()
+
+# ── AI ─────────────────────────────────────────────────────────────────────────
+@dp.callback_query_handler(lambda c: c.data == "M_ai")
+async def h_ai_mode(call: types.CallbackQuery):
+    uid = call.from_user.id
+    if not ok(uid): return await call.answer("⛔",show_alert=True)
+    mode_map[uid] = "ai"
+    await try_edit(call.message,
+        "🤖 <b>وضع الذكاء الاصطناعي</b>\n\n"
+        "أرسل أي سؤال وسأجيبك!\n"
+        "المحادثة تتذكر سياقها تلقائياً.",
+        kb_ai(uid))
+    await call.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "AI_clear")
+async def h_ai_clear(call: types.CallbackQuery):
+    uid = call.from_user.id
+    if not ok(uid): return await call.answer("⛔",show_alert=True)
+    ai_hist.pop(uid, None)
+    await try_edit(call.message,
+        "🤖 <b>وضع الذكاء الاصطناعي</b>\n\n"
+        "✅ تم مسح المحادثة. أرسل سؤالاً جديداً:",
+        kb_ai(uid))
     await call.answer()
 
 # ── MODE ───────────────────────────────────────────────────────────────────────
@@ -251,13 +325,13 @@ async def h_mode(call: types.CallbackQuery):
         await try_edit(call.message, "اختر الحقل:", kb_split())
     elif m == "full":
         mode_map[uid] = "full"
-        await try_edit(call.message, "🔍 أرسل الكلمة للبحث:", kb_back())
-    else:
+        await try_edit(call.message, "🔍 أرسل الكلمة:", kb_back())
+    elif m == "email":
         mode_map[uid] = "email"
-        await try_edit(call.message, "📧 أرسل الإيميل للبحث:", kb_back())
+        await try_edit(call.message, "📧 أرسل الإيميل:", kb_back())
     await call.answer()
 
-# ── حقل البحث المنفصل ──────────────────────────────────────────────────────────
+# ── حقل البحث ──────────────────────────────────────────────────────────────────
 FMAP = {"F_user":"user","F_email":"email","F_phone":"phone","F_id":"id"}
 FAR  = {"user":"اليوزر","email":"الإيميل","phone":"الهاتف","id":"الآيدي"}
 
@@ -270,7 +344,7 @@ async def h_field(call: types.CallbackQuery):
     await try_edit(call.message, f"🔎 بحث في [{FAR[key]}]. أرسل القيمة:", kb_back())
     await call.answer()
 
-# ── بانل الإدمن ────────────────────────────────────────────────────────────────
+# ── ADMIN ──────────────────────────────────────────────────────────────────────
 @dp.callback_query_handler(lambda c: c.data == "ADMIN")
 async def h_admin(call: types.CallbackQuery):
     if not adm(call.from_user.id): return await call.answer("⛔",show_alert=True)
@@ -285,11 +359,13 @@ async def h_admin_act(call: types.CallbackQuery):
 
     if act == "stats":
         ts = sum(1 for e in counts.values() if e.get("d")==today())
+        ai_users = len(ai_hist)
         await try_edit(call.message,
             f"📊 <b>إحصائيات</b>\n\n"
             f"👥 مستخدمون: {len(allowed)}\n"
             f"⏳ معلّقون: {len(pending)}\n"
             f"🔍 بحث اليوم: {ts}\n"
+            f"🤖 محادثات AI نشطة: {ai_users}\n"
             f"💾 البيانات: {'✅ جاهزة' if is_ready else '⏳ تحميل'}\n"
             f"📅 {today()}", kb_admin())
 
@@ -301,18 +377,20 @@ async def h_admin_act(call: types.CallbackQuery):
         mode_map[uid] = "set_welcome"
         await try_edit(call.message,
             f"📝 أرسل رسالة الترحيب الجديدة:\n\nالحالية: <code>{esc(welcome[0])}</code>",
-            InlineKeyboardMarkup().add(InlineKeyboardButton("↩️ إلغاء",callback_data="ADMIN")))
+            InlineKeyboardMarkup().add(
+                InlineKeyboardButton("↩️ إلغاء", callback_data="ADMIN")))
 
     elif act == "users":
         ids = "\n".join(f"• <code>{u}</code>" for u in sorted(allowed))
-        await try_edit(call.message, f"👥 <b>المستخدمون ({len(allowed)})</b>\n\n{ids}", kb_admin())
+        await try_edit(call.message,
+            f"👥 <b>المستخدمون ({len(allowed)})</b>\n\n{ids}", kb_admin())
 
     elif act == "pending":
         if not pending:
             await try_edit(call.message, "✅ لا توجد طلبات معلّقة.", kb_admin())
         else:
-            await try_edit(call.message, f"⏳ <b>الطلبات المعلّقة ({len(pending)})</b>", kb_admin())
-            # كل طلب برسالة منفصلة مع زري قبول/رفض
+            await try_edit(call.message,
+                f"⏳ <b>الطلبات المعلّقة ({len(pending)})</b>", kb_admin())
             for puid, inf in list(pending.items()):
                 await notify(uid,
                     f"👤 <b>{esc(inf.get('name','؟'))}</b>\n"
@@ -322,7 +400,7 @@ async def h_admin_act(call: types.CallbackQuery):
 
     await call.answer()
 
-# ── أوامر إدمن نصية ────────────────────────────────────────────────────────────
+# ── أوامر نصية ─────────────────────────────────────────────────────────────────
 @dp.message_handler(commands=["adduser"])
 async def h_adduser(msg: types.Message):
     if not adm(msg.from_user.id): return
@@ -351,8 +429,10 @@ async def h_admin_cmd(msg: types.Message):
 @dp.message_handler(commands=["status"])
 async def h_status(msg: types.Message):
     if not ok(msg.from_user.id): return
-    st = "✅ جاهزة" if is_ready else "⏳ جارٍ التحميل"
-    await msg.reply(f"البيانات: {st}")
+    ai_ok = "✅ متصل" if ANTHROPIC_KEY else "❌ غير مفعّل"
+    await msg.reply(
+        f"البيانات: {'✅ جاهزة' if is_ready else '⏳ جارٍ التحميل'}\n"
+        f"🤖 الذكاء الاصطناعي: {ai_ok}")
 
 # ── معالج النصوص الوحيد ────────────────────────────────────────────────────────
 @dp.message_handler()
@@ -360,7 +440,6 @@ async def h_text(msg: types.Message):
     uid  = msg.from_user.id
     text = (msg.text or "").strip()
 
-    # غير مسموح → تجاهل
     if not ok(uid): return
 
     # كلمات القائمة
@@ -374,11 +453,18 @@ async def h_text(msg: types.Message):
         mode_map.pop(uid,None)
         return await msg.reply("✅ تم تغيير رسالة الترحيب.", reply_markup=kb_admin())
 
-    # بيانات غير جاهزة
+    # ── وضع AI ──────────────────────────────────────────────────────────────────
+    if mode_map.get(uid) == "ai":
+        wait = await msg.reply("🤖 جارٍ التفكير …")
+        reply = await asyncio.get_event_loop().run_in_executor(
+            None, ask_claude, uid, text)
+        await wait.delete()
+        return await msg.reply(reply, reply_markup=kb_ai(uid))
+
+    # ── البحث ───────────────────────────────────────────────────────────────────
     if not is_ready:
         return await msg.reply("⏳ البيانات لا تزال تُحمَّل، انتظر قليلاً.")
 
-    # حد يومي
     if not adm(uid) and day_count(uid) >= MAX_DAY:
         return await msg.reply(f"❌ انتهت حصتك اليومية ({MAX_DAY} بحث).")
 
@@ -389,8 +475,8 @@ async def h_text(msg: types.Message):
 
     if not adm(uid): inc(uid)
 
-    mode  = mode_map.get(uid, "full")
-    wait  = await msg.reply("🔄 جارٍ البحث …")
+    mode = mode_map.get(uid, "full")
+    wait = await msg.reply("🔄 جارٍ البحث …")
 
     try:
         if   mode == "full":            lines = search_full(query)
@@ -410,7 +496,6 @@ async def h_text(msg: types.Message):
     sep  = "\n\n" if mode=="email" else "\n"
     head = f"✅ النتائج ({len(lines)}):"
 
-    # تقطيع
     chunks, buf = [], []
     for line in lines:
         buf.append(line)
@@ -428,4 +513,5 @@ async def h_text(msg: types.Message):
 
 # ── تشغيل ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+
     executor.start_polling(dp, skip_updates=True)
